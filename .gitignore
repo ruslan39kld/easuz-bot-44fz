@@ -25,4 +25,4 @@ data/
 *.log
 
 # Telegram bot config (содержит токен!)
-config.py
+config.pydata/ 
