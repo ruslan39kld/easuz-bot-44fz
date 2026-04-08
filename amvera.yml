@@ -3,12 +3,13 @@ meta:
   toolchain:
     name: pip
     version: "3.11"
+
 build:
   requirementsPath: requirements_rag.txt
   useCache: false
+
 run:
-  scriptName: src/bot.py
-  command: null
+  command: python src/bot.py
   persistenceMount: /data
   containerPort: "80"
   servicePort: "80"
