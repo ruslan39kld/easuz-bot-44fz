@@ -14,9 +14,13 @@ import re
 class HybridSearch:
     """
     Гибридный поиск: FAISS (векторный) + BM25 (ключевые слова)
-    - Индекс и метаданные берутся из data/easuz_index/
-    - BM25 строится по тем же объектам, что и в векторном индексе (общие IDs)
-    Возвращает список словарей: {question, answer, source_file, score}
+    + Фильтрация по категориям (44fz, 223fz, ARIP)
+    
+    Улучшения:
+    - Динамический вес: короткие запросы (1-2 слова) → больше BM25
+    - Фильтрация по категории
+    - Дедупликация по source_file
+    - Фильтрация по минимальному score
     """
 
     def __init__(self,
@@ -39,34 +43,41 @@ class HybridSearch:
             self.metadata = pickle.load(f)
         self.ntotal = len(self.metadata)
 
-        # Модель для векторизации запросов (должна совпадать с индексацией)
         logging.info(f"[HybridSearch] Загрузка модели эмбеддингов: {model_name}")
         self.model = SentenceTransformer(model_name)
 
-        # Подготовка корпуса для BM25 (используем те же элементы, что и в FAISS)
         logging.info("[HybridSearch] Построение BM25 корпуса по метаданным индекса...")
         self.corpus_texts: List[str] = []
         for item in self.metadata:
             if item.get('type') == 'qa':
                 text = f"{item.get('question', '')}\n{item.get('answer', '')}"
             else:
-                # chunk
                 text = item.get('text', '')
             self.corpus_texts.append(text)
 
         self.corpus_tokens = [self._tokenize_ru(t) for t in self.corpus_texts]
         self.bm25 = BM25Okapi(self.corpus_tokens)
+        
+        # ⭐ НОВОЕ: Статистика по категориям
+        categories_count = {}
+        for m in self.metadata:
+            cat = m.get('category', 'unknown')
+            categories_count[cat] = categories_count.get(cat, 0) + 1
+        
         logging.info(f"[HybridSearch] BM25 готов: документов = {len(self.corpus_tokens)}")
+        logging.info(f"[HybridSearch] Категории: {categories_count}")
 
     def _tokenize_ru(self, text: str) -> List[str]:
-        # Простая токенизация по словам (кириллица/латиница/цифры)
+        """Простая токенизация по словам (кириллица/латиница/цифры)"""
         return [w for w in re.findall(r"[\w]+", (text or '').lower()) if len(w) > 2]
 
     def _encode_query(self, query: str) -> np.ndarray:
+        """Векторизация поискового запроса"""
         q = self.model.encode([query], normalize_embeddings=True)
         return q.astype('float32')
 
     def _normalize(self, scores: np.ndarray) -> np.ndarray:
+        """Нормализация скоров в диапазон [0, 1]"""
         if scores.size == 0:
             return scores
         s_min = float(scores.min())
@@ -75,78 +86,141 @@ class HybridSearch:
             return np.zeros_like(scores)
         return (scores - s_min) / (s_max - s_min)
 
-    def search(self, query: str, top_k: int = 5, vector_weight: float = 0.7) -> List[Dict[str, Any]]:
+    def search(self, 
+               query: str, 
+               top_k: int = 5, 
+               vector_weight: float = 0.7,
+               category: str = None) -> List[Dict[str, Any]]:
         """
-        Гибридный поиск.
-        combined = w * vector_score + (1-w) * bm25_score
-        Возвращает [{question, answer, source_file, score}]
+        Гибридный поиск с фильтрацией по категориям.
+        
+        Args:
+            query: Поисковый запрос
+            top_k: Количество результатов
+            vector_weight: Вес векторного поиска (игнорируется, рассчитывается динамически)
+            category: Фильтр по категории ("44fz", "223fz", "ARIP" или None для всех)
+        
+        Returns:
+            Список результатов [{question, answer, source_file, category, score}]
         """
         if not query:
             return []
 
+        # ⭐ ЛОГИРОВАНИЕ категории
+        if category:
+            logging.info(f"[HybridSearch] Поиск в категории: {category}")
+        else:
+            logging.info(f"[HybridSearch] Поиск по ВСЕМ категориям")
+
+        # Динамический вес в зависимости от длины запроса
+        query_tokens = self._tokenize_ru(query)
+        if len(query_tokens) <= 2:
+            vector_weight = 0.4
+            logging.info(f"[HybridSearch] Короткий запрос ({len(query_tokens)} слов) → vector_weight=0.4")
+        else:
+            vector_weight = 0.7
+            logging.info(f"[HybridSearch] Длинный запрос ({len(query_tokens)} слов) → vector_weight=0.7")
+
         # 1) Векторный поиск через FAISS
         q_vec = self._encode_query(query)
         faiss_k = min(max(top_k * 5, top_k), self.index.ntotal)
-        sims, idxs = self.index.search(q_vec, faiss_k)  # inner product ~ cosine
-        vec_scores = sims[0]  # shape: (faiss_k,)
+        sims, idxs = self.index.search(q_vec, faiss_k)
+        vec_scores = sims[0]
         vec_idxs = idxs[0]
 
-        # Нормализуем векторные оценки в 0..1 (обычно уже 0..1, но на всякий случай)
         vec_scores_norm = self._normalize(vec_scores)
 
         # 2) Ключевой поиск через BM25
-        q_tokens = self._tokenize_ru(query)
-        bm25_scores_all = np.array(self.bm25.get_scores(q_tokens), dtype=np.float32)
-        # возьмем те же кандидаты из FAISS + топ по BM25, чтобы объединить
+        bm25_scores_all = np.array(self.bm25.get_scores(query_tokens), dtype=np.float32)
         bm25_top_k = min(faiss_k, self.ntotal)
         bm25_top_idxs = np.argsort(-bm25_scores_all)[:bm25_top_k]
-        bm25_top_scores = bm25_scores_all[bm25_top_idxs]
-        bm25_scores_norm_all = self._normalize(bm25_scores_all)
 
-        # 3) Объединяем кандидатов (множество индексов)
+        # 3) Объединяем кандидатов
         candidate_set = set(vec_idxs.tolist()) | set(bm25_top_idxs.tolist())
+        
+        # Нормализуем BM25 только по кандидатам
+        candidate_list = list(candidate_set)
+        candidate_bm25_scores = bm25_scores_all[candidate_list]
+        candidate_bm25_norm = self._normalize(candidate_bm25_scores)
+        bm25_score_map = dict(zip(candidate_list, candidate_bm25_norm))
 
+        # 4) Вычисляем комбинированные скоры
         results: List[Dict[str, Any]] = []
+        filtered_by_category = 0
+        
         for i in candidate_set:
             m = self.metadata[i]
+            
+            # ⭐ ФИЛЬТРАЦИЯ ПО КАТЕГОРИИ
+            doc_category = m.get('category', 'unknown')
+            if category and doc_category != category:
+                filtered_by_category += 1
+                continue  # Пропускаем документы из других категорий
+            
+            # Векторный скор
             v_score = 0.0
-            b_score = 0.0
-            # если индекс есть в выборке FAISS — берем норм. балл, иначе 0
             try:
                 pos = int(np.where(vec_idxs == i)[0][0])
                 v_score = float(vec_scores_norm[pos])
             except Exception:
                 v_score = 0.0
-            # BM25 норм. балл берём из полного массива
-            b_score = float(bm25_scores_norm_all[i])
+            
+            # BM25 скор из карты
+            b_score = float(bm25_score_map.get(i, 0.0))
 
             combined = vector_weight * v_score + (1.0 - vector_weight) * b_score
 
+            # Формируем результат
             if m.get('type') == 'qa':
                 question = m.get('question', '')
                 answer = m.get('answer', '')
                 source = m.get('source', '')
             else:
-                # chunk
-                question = (m.get('text', '') or '')[:200]
-                answer = ''
+                full_text = m.get('text', '')
+                question = full_text[:200]
+                answer = full_text
                 source = m.get('source', '')
 
             results.append({
                 'question': question,
                 'answer': answer,
                 'source_file': source,
+                'category': doc_category,  # ⭐ СОХРАНЯЕМ КАТЕГОРИЮ
                 'score': combined
             })
 
-        # 4) Сортируем по комбинированному скору и отбираем top_k
+        # ⭐ ЛОГИРОВАНИЕ фильтрации
+        if category:
+            logging.info(f"[HybridSearch] Отфильтровано по категории: {filtered_by_category} документов")
+
+        # 5) Сортируем
         results.sort(key=lambda x: x['score'], reverse=True)
-        top = results[:top_k]
+
+        # 6) Фильтрация по порогу
+        MIN_SCORE_THRESHOLD = 0.3
+        results = [r for r in results if r['score'] >= MIN_SCORE_THRESHOLD]
+
+        # 7) Дедупликация по source_file
+        seen_sources = set()
+        unique_results = []
+        for res in results:
+            src = res['source_file']
+            if src not in seen_sources:
+                seen_sources.add(src)
+                unique_results.append(res)
+                if len(unique_results) >= top_k:
+                    break
+
+        top = unique_results[:top_k]
 
         logging.info(
-            f"[HybridSearch] query='{query[:80]}' | vec_top={len(vec_idxs)} bm25_top={len(bm25_top_idxs)} -> return={len(top)}"
+            f"[HybridSearch] query='{query[:80]}' | category={category or 'ALL'} | "
+            f"candidates={len(candidate_set)} filtered={len(results)} -> unique={len(top)}"
         )
         if top:
-            logging.info(f"[HybridSearch] TOP1: {top[0]['question'][:80]} | score={top[0]['score']:.3f}")
+            logging.info(
+                f"[HybridSearch] TOP1: {top[0]['question'][:80]} | "
+                f"category={top[0]['category']} | score={top[0]['score']:.3f}"
+            )
 
         return top

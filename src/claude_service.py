@@ -1,235 +1,308 @@
-import httpx
 import asyncio
 import logging
 import time
 import re
-from typing import Tuple
+from typing import Tuple, List, Dict
+from gigachat import GigaChat
 import config
-from prompts import SYSTEM_PROMPT
-from hybrid_search import HybridSearch
+
 
 class ClaudeService:
-    """Сервис для работы с Claude AI через vsegpt.ru (ASYNC с httpx)"""
-    
+    """
+    v21 — Использование официальной библиотеки GigaChat
+    """
+
+    ABBREVIATIONS = {
+        'еасуз': 'единая автоматизированная система управления закупками',
+        'еис': 'единая информационная система',
+        'пик': 'программно информационный комплекс',
+        'гис рэб': 'государственная информационная система расходов электронных бюджетов',
+        'чс': 'чрезвычайная ситуация чрезвычайный',
+        'грбс': 'главный распорядитель бюджетных средств',
+        'рбс': 'распорядитель бюджетных средств',
+        'нмцк': 'начальная максимальная цена контракта',
+        'план-график': 'план график закупок планирование',
+        'спгз': 'справочник планирования проведения государственных закупок',
+        'ктру': 'каталог товаров работ услуг',
+        'закупка': 'закупка процедура определение поставщика',
+        'контракт': 'государственный контракт муниципальный',
+        'тз': 'техническое задание требования',
+        'поставщик': 'поставщик подрядчик исполнитель участник',
+        'заказчик': 'государственный заказчик муниципальный',
+        'аукцион': 'электронный аукцион',
+        'конкурс': 'открытый конкурс',
+        'единственный поставщик': 'закупка единственного поставщика',
+        'экк0': 'карточка расчета обоснования цены',
+        'экк1': 'карточка проекта контракта',
+        'экк2': 'карточка контракта',
+        '44-фз': 'федеральный закон контрактной системе 44',
+    }
+
+    _semaphore = asyncio.Semaphore(10)
+
     def __init__(self):
-        self.api_key = config.CLAUDE_API_KEY
-        self.endpoint = config.CLAUDE_ENDPOINT
-        self.model = config.CLAUDE_MODEL
-        self.hybrid_search = HybridSearch()
+        self.auth_key = config.GIGACHAT_CLIENT_SECRET
+        self.scope = config.GIGACHAT_SCOPE
+        self.model = config.GIGACHAT_MODEL
         
-        if not self.api_key:
-            raise ValueError("CLAUDE_API_KEY не установлен")
+        if not self.auth_key:
+            logging.error("❌ GIGACHAT_CLIENT_SECRET не найден!")
+            raise ValueError("GIGACHAT_CLIENT_SECRET не установлен")
+        
+        logging.info(f"[GigaChat] ✅ Инициализация: model={self.model}, scope={self.scope}")
     
-    def _extract_keywords(self, text: str) -> list:
-        """Извлечь ключевые слова из текста"""
-        stop_words = {'как', 'что', 'где', 'когда', 'для', 'или', 'и', 'в', 'на', 'с', 'по', 'я', 'мне', 'нужно', 'можно', 'это', 'быть'}
-        words = re.findall(r'\b\w+\b', text.lower())
-        keywords = [w for w in words if len(w) > 3 and w not in stop_words]
-        return keywords[:5]
+    def _expand_abbreviations(self, text: str) -> str:
+        expanded = text
+        text_lower = text.lower()
+        sorted_abbr = sorted(self.ABBREVIATIONS.items(), key=lambda x: len(x[0]), reverse=True)
+        for abbr, full in sorted_abbr:
+            pattern = r'\b' + re.escape(abbr) + r'\b'
+            if re.search(pattern, text_lower):
+                expanded = re.sub(pattern, full, expanded, flags=re.IGNORECASE)
+                logging.info(f"[Expand] '{abbr}' → '{full}'")
+        return expanded
     
-    async def ask(self, query: str, database) -> Tuple[str, int]:
-        """Отправка запроса в Claude AI с умным поиском (ASYNC)"""
-        start_time = time.time()
-        
-        logging.info(f"[ClaudeService] Начало обработки запроса: {query[:50]}...")
-        
-        # Извлекаем ключевые слова для улучшенного поиска
-        keywords = self._extract_keywords(query)
-        search_query = " ".join(keywords) if keywords else query
-        
-        logging.info(f"[ClaudeService] Ключевые слова: {keywords}")
-        logging.info(f"[ClaudeService] Поисковый запрос: '{search_query}'")
-        
-        # Поиск документов гибридным поиском (FAISS + BM25)
-        docs = self.hybrid_search.search(search_query, top_k=3, vector_weight=0.7)
-        
-        logging.info(f"[ClaudeService] Найдено документов: {len(docs)}")
-        
-        if not docs:
-            logging.warning("[ClaudeService] Документы не найдены")
-            return self._no_docs_response(), int((time.time() - start_time) * 1000)
-        
-        # Логируем найденные документы
-        for i, doc in enumerate(docs[:3], 1):
-            logging.info(f"  {i}. {doc.get('question','')[:60]} | score={doc.get('score',0):.3f}")
-        
-        # Формирование контекста из найденных документов
-        context = self._build_context(docs)
-        full_prompt = self._build_full_prompt(query, context)
-        
-        # Детальное логирование перед отправкой
-        logging.info(f"[Claude] Отправляем контекст из {len(docs)} документов")
-        logging.info(f"[Claude] Первый документ: {docs[0].get('question','')[:50]}")
-        logging.info(f"[Claude] Размер промпта: {len(full_prompt)} символов")
-        
-        try:
-            logging.info("[ClaudeService] Отправка запроса в Claude API...")
+    def _extract_keywords(self, text: str) -> List[str]:
+        text_lower = text.lower()
+        stop_words = {
+            'как', 'что', 'где', 'когда', 'почему', 'зачем', 'кто', 'чей', 'какой', 'который',
+            'для', 'или', 'и', 'в', 'на', 'с', 'по', 'из', 'о', 'об', 'к', 'от', 'до', 'при', 'через',
+            'я', 'мне', 'нужно', 'можно', 'это', 'быть', 'есть', 'был', 'была', 'были', 'будет',
+            'делать', 'сделать', 'нужен', 'надо', 'хочу', 'могу', 'должен', 'ли', 'бы', 'же',
+        }
+        priority_phrases = [
+            'главный распорядитель бюджетных средств',
+            'чрезвычайная ситуация',
+            'план график закупок',
+            'единственный поставщик',
+            'техническое задание',
+            'государственный контракт',
+        ]
+        keywords = []
+        for phrase in priority_phrases:
+            if phrase in text_lower:
+                keywords.append(phrase)
+                text_lower = text_lower.replace(phrase, ' ')
+        words = re.findall(r'\b[а-яё]{3,}\b', text_lower)
+        for word in words:
+            if word not in stop_words and word not in ' '.join(keywords):
+                keywords.append(word)
+        return keywords[:8]
+
+    def sanitize_markdown(self, text: str) -> str:
+        text = re.sub(r'<[^>]+>', '', text)
+        if text.count('**') % 2 != 0:
+            text = text.replace('**', '')
+        temp = text.replace('**', '__TEMP__')
+        if temp.count('*') % 2 != 0:
+            text = text.replace('*', '')
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        if len(text.encode('utf-8')) > 4096:
+            text = text[:4000] + "\n\n... (обрезано)"
+        return text.strip()
+
+    async def ask(self, query: str, database, knowledge_base, category: str = None) -> Tuple[str, int]:
+        async with self._semaphore:
+            start_time = time.time()
+            logging.info(f"[GigaChat] ========== НОВЫЙ ЗАПРОС ==========")
+            logging.info(f"[GigaChat] Запрос: '{query}'")
             
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(
-                    self.endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": full_prompt
-                            }
-                        ],
-                        "temperature": 0.05,
-                        "max_tokens": 2000
-                    }
-                )
+            if category:
+                logging.info(f"[GigaChat] Категория: {category}")
+            
+            expanded_query = self._expand_abbreviations(query)
+            keywords = self._extract_keywords(expanded_query)
+            search_query = " ".join(keywords) if keywords else expanded_query
+            
+            logging.info(f"[Search] Расширенный: '{expanded_query}' | Keywords: {keywords}")
+            
+            docs = knowledge_base.search(search_query, top_k=3, vector_weight=0.6, category=category)
+            if not docs:
+                logging.warning("[GigaChat] Документы не найдены")
+                return self._fallback_response(query, category), int((time.time() - start_time) * 1000)
+            
+            top_docs = docs[:3]
+            context = self._build_context(top_docs)
+            prompt = self._build_prompt(query, context)
+            
+            try:
+                logging.info("[GigaChat] → GigaChat API...")
                 
-                response_time_ms = int((time.time() - start_time) * 1000)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    answer = result['choices'][0]['message']['content']
-                    logging.info(f"[ClaudeService] Ответ получен за {response_time_ms}ms")
+                # Используем официальную библиотеку GigaChat
+                with GigaChat(
+                    credentials=self.auth_key,
+                    scope=self.scope,
+                    model=self.model,
+                    verify_ssl_certs=False
+                ) as giga:
+                    response = giga.chat(prompt)
+                    answer = response.choices[0].message.content
+                    
+                    if "→" in answer:
+                        logging.warning("[GigaChat] Обнаружены стрелочки — используем fallback")
+                        answer = self._fallback_response(query, category)
+                    
+                    answer = self.sanitize_markdown(answer)
+                    response_time_ms = int((time.time() - start_time) * 1000)
+                    logging.info(f"[GigaChat] ✅ Ответ: {len(answer)} символов | {response_time_ms}ms")
                     return answer, response_time_ms
-                else:
-                    logging.error(f"[ClaudeService] Claude API error: {response.status_code} - {response.text}")
-                    return self._error_response(), response_time_ms
-                        
-        except httpx.TimeoutException:
-            logging.error("[ClaudeService] Claude API timeout")
-            return "⏱️ Превышено время ожидания ответа. Попробуйте упростить вопрос.", int((time.time() - start_time) * 1000)
-            
-        except Exception as e:
-            logging.error(f"[ClaudeService] Exception: {e}", exc_info=True)
-            return self._error_response(), int((time.time() - start_time) * 1000)
+                            
+            except Exception as e:
+                logging.error(f"[GigaChat] ❌ Exception: {e}", exc_info=True)
+                return self._error_response(), int((time.time() - start_time) * 1000)
     
-    def _build_context(self, docs: list) -> str:
-        """Формирование контекста из документов"""
-        context_parts = []
-        for doc in docs[:3]:
-            title = doc.get('question', 'Без названия')
-            answer = doc.get('answer', '')
-            source = doc.get('source_file', '')
-            combined = f"Вопрос: {title}\n\nОтвет: {answer}\n\nИсточник: {source}"
-            snippet = combined[:1500] if len(combined) > 1500 else combined
-            # ИСПРАВЛЕНО: Убрали эмодзи 📄
-            context_parts.append(f"ДОКУМЕНТ: {title}\n\n{snippet}")
-        return "\n\n" + "="*60 + "\n\n".join(context_parts)
+    def _build_context(self, docs: List[Dict]) -> str:
+        parts = []
+        for i, doc in enumerate(docs, 1):
+            q = doc.get('question', 'Без названия')
+            a = doc.get('answer', '')[:2500]
+            s = doc.get('source_file', 'Неизвестно')
+            parts.append(f"ДОКУМЕНТ {i}:\nВопрос: {q}\nОтвет: {a}\nИсточник: {s}")
+        return "\n\n" + ("="*50 + "\n\n").join(parts)
     
-    def _build_full_prompt(self, query: str, context: str) -> str:
-        """Формирование полного промпта"""
-        return f"""Ты — профессиональный AI-ассистент по системе ЕАСУЗ 44-ФЗ.
+    def _build_prompt(self, query: str, context: str) -> str:
+        return f"""ТЫ — ЭКСПЕРТ ПО ЕАСУЗ. ДАЙ ОТВЕТ В СТИЛЕ СТАРЫХ ОТВЕТОВ.
+        ВАЖНО: Твой ответ должен быть МАКСИМАЛЬНО ПОДРОБНЫМ и РАЗВЕРНУТЫМ (не менее 1000 символов). 
 
-🎯 ГЛАВНОЕ ПРАВИЛО:
-Ты ДОЛЖЕН давать полезный ответ на основе предоставленных документов ниже.
-НИКОГДА не говори "информации нет" или "инструкции не найдены", если документы предоставлены.
-ВСЕГДА находи в документах полезную информацию и формулируй на её основе четкий ответ.
+        ДАЙ ОТВЕТ В СТИЛЕ СТАРЫХ ОТВЕТОВ.
 
-📋 АЛГОРИТМ РАБОТЫ:
-1. Внимательно изучи ВСЕ документы ниже
-2. Найди информацию, относящуюся к вопросу пользователя
-3. Сформулируй четкий, структурированный ответ
-4. Используй Markdown: заголовки (##), списки (•), **жирный текст**, *курсив*
-5. Укажи источник документа в конце ответа В HTML ФОРМАТЕ
-6. Если есть пошаговые инструкции — перечисли их подробно
+⚠️ КРИТИЧЕСКИЕ ТРЕБОВАНИЯ:
 
-📚 ДОКУМЕНТЫ ИЗ БАЗЫ ЗНАНИЙ:
+1. НЕ ИСПОЛЬЗУЙ стрелочки →
+2. НЕ ПИШИ "информации нет" или "уточните вопрос"
+3. ИСПОЛЬЗУЙ заголовки ## и списки -
+4. ВСЕГДА указывай источник в конце
+5. Если есть пошаговая инструкция (Этапы, Порядок) — ОБЯЗАТЕЛЬНО используй НУМЕРАЦИЮ: 1., 2., 3.
+6. ВСЕГДА указывай систему в скобках: (ЕАСУЗ), (ЕИС), (ГИС РЭБ), (ПИК)
+7. ОТВЕТ ДОЛЖЕН БЫТЬ ПОДРОБНЫМ — минимум 1200-1500 символов
+8. РАСКРЫВАЙ все детали, давай полный развернутый ответ
+
+📋 ФОРМАТ ОТВЕТА:
+
+Первое предложение: Прямой ответ
+
+## Основания / Особенности / Причины (если есть)
+- Пункт 1
+- Пункт 2
+
+## Этапы / Порядок действий (если есть)
+1. Действие в системе (СИСТЕМА)
+2. Другое действие (СИСТЕМА)
+
+Источник: Название_файла.xlsx
+
+✅ ПРИМЕР:
+Закупка при ЧС оформляется по п.9 ст.93 44-ФЗ как закупка у единственного поставщика.
+
+## Основания для применения
+- Оказание медицинской помощи в неотложной форме
+- Авария или обстоятельства непреодолимой силы
+- Предупреждение ЧС
+- Ликвидация ЧС
+- Оказание гуманитарной помощи
+
+## Этапы оформления
+1. Проверка наличия бюджетных ассигнований (ЕАСУЗ)
+2. Внесение закупки в план-график (ЕАСУЗ)
+3. Согласование с ГРБС (ЕАСУЗ)
+4. Публикация в ЕИС (ЕИС)
+5. Прохождение финансового контроля (ЕИС)
+6. Расчет цены в ПИК (ПИК ЕАСУЗ)
+7. Подготовка проекта контракта (ПИК ЕАСУЗ)
+8. Заключение контракта (ЕИС или ЕАСУЗ)
+
+Источник: Инструкция по ЧС.docx
+
+❌ НЕ ПИШИ:
+"Планирование → В системе ЕАСУЗ → Раздел «План-график» → Добавить новую закупку" — это НЕ инструкция!
+
+ДОКУМЕНТЫ:
 {context}
 
-❓ ВОПРОС ПОЛЬЗОВАТЕЛЯ:
-{query}
+ВОПРОС: {query}
 
-💡 СТРУКТУРА ТВОЕГО ОТВЕТА:
-## Заголовок (краткий ответ)
+ОТВЕЧАЙ ТОЛЬКО В УКАЗАННОМ ФОРМАТЕ:"""
 
-Подробное объяснение...
+    def _fallback_response(self, query: str, category: str = None) -> str:
+        q = query.lower()
+        cat_names = {'44fz': '44-ФЗ', '223fz': '223-ФЗ', 'ARIP': 'АРИП'}
+        cat_name = cat_names.get(category, 'выбранной категории')
+        
+        if 'что такое еасуз' in q:
+            return """Единая автоматизированная система управления закупками (ЕАСУЗ) — это региональная информационная система для планирования, формирования и проведения закупок в соответствии с Федеральным законом № 44-ФЗ.
 
-### Пошаговая инструкция (если применимо):
-1. Шаг первый...
-2. Шаг второй...
+## Описание
+- Предназначена для автоматизации процессов закупок
+- Выполняет функции: планирования, согласования, подготовки документации
+- Работает в связке с ЕИС и ГИС РЭБ
 
-<b>Источник:</b> Название_документа.расширение
+Источник: Общая информация системы ЕАСУЗ"""
+        
+        elif 'грбс' in q:
+            return """Главный распорядитель бюджетных средств (ГРБС) — орган государственной власти, имеющий право распределять бюджетные ассигнования и лимиты бюджетных обязательств между подведомственными распорядителями и получателями бюджетных средств.
 
-💡 **Рекомендация:** ...
+## Основные функции
+- Утверждение плана-графика закупок
+- Согласование закупок в чрезвычайных ситуациях
+- Распределение бюджетных ассигнований
+- Контроль за целевым и эффективным использованием бюджетных средств
 
-⚠️⚠️⚠️ КРИТИЧНО: ФОРМАТИРОВАНИЕ ⚠️⚠️⚠️
+## Порядок согласования
+1. Заказчик формирует план-график (ЕАСУЗ)
+2. Направляет на согласование с ГРБС (ЕАСУЗ)
+3. ГРБС проверяет наличие бюджетных ассигнований (ЕАСУЗ, ГИС РЭБ)
+4. ГРБС утверждает или возвращает на доработку (ЕАСУЗ)
 
-ДЛЯ ОСНОВНОГО ТЕКСТА ИСПОЛЬЗУЙ MARKDOWN:
-✅ ## Заголовок
-✅ ### Подзаголовок
-✅ **жирный текст**
-✅ *курсив*
-✅ - списки
-✅ 1. нумерованные списки
+Источник: Общая информация по бюджетной системе"""
+        
+        elif 'чс' in q or 'чрезвычайн' in q:
+            return """Закупка при чрезвычайной ситуации оформляется как закупка у единственного поставщика.
 
-ТОЛЬКО ДЛЯ ИСТОЧНИКА ИСПОЛЬЗУЙ HTML:
-✅ <b>Источник:</b> Название.расширение
-✅ <b>Рекомендация:</b> текст
+## Основания для применения
+- Оказание медицинской помощи в неотложной или экстренной форме
+- Авария или обстоятельства непреодолимой силы
+- Предупреждение чрезвычайной ситуации
+- Ликвидация чрезвычайной ситуации
+- Оказание гуманитарной помощи
 
-ФОРМАТ ИСТОЧНИКА:
-<b>Источник:</b> Название_файла.расширение
+## Этапы оформления
+1. Проверка наличия объекта закупки в государственной программе (ЕАСУЗ)
+2. Подтверждение наличия бюджетных ассигнований (ЕАСУЗ, ГИС РЭБ)
+3. Внесение изменений в план-график закупок (ЕАСУЗ)
+4. Согласование с ГРБС (ЕАСУЗ)
+5. Размещение извещения в ЕИС (ЕИС)
+6. Расчет и обоснование цены (ПИК ЕАСУЗ)
+7. Подготовка проекта контракта (ПИК ЕАСУЗ)
+8. Заключение контракта (ЕИС или ЕАСУЗ)
 
-ПРАВИЛА ИСТОЧНИКА:
-1. ✅ ТОЛЬКО HTML-тег для слова "Источник": <b>Источник:</b>
-2. ✅ Пробел после закрывающего тега </b>
-3. ✅ Полное название файла с расширением на той же строке
-4. ❌ БЕЗ эмодзи 📄
-5. ❌ БЕЗ тире "- "
-6. ❌ БЕЗ переноса на новую строку (всё в одну строку!)
-7. ❌ БЕЗ множественного числа "Источники:"
-8. ✅ ТОЛЬКО ОДИН источник (самый релевантный)
-9. ❌ НЕ ИСПОЛЬЗУЙ <b> в основном тексте - только в источнике!
+Источник: Общая информация по процедурам закупок"""
+        
+        else:
+            return f"""По запросу «{query}» не найдено информации в базе знаний по направлению **{cat_name}**.
 
-❌ НЕПРАВИЛЬНЫЕ ПРИМЕРЫ:
-📄 Источник: ...
-Источник: - ...
-<b>Источники:</b> ...
-- <b>Источник:</b> ...
-<b>Источник:</b>
-Название.xlsx (перенос - НЕПРАВИЛЬНО!)
-Нажмите <b>Кнопку</b> (НЕ используй HTML в тексте!)
+## Возможные причины
+- Вопрос относится к другому направлению
+- Используются специфические термины
+- Информация отсутствует в загруженных документах
 
-✅ ПРАВИЛЬНЫЕ ПРИМЕРЫ:
-Основной текст: Нажмите **Кнопку** (Markdown!)
-Источник: <b>Источник:</b> Инструкция.docx (HTML!)
+## Рекомендации
+💡 **Попробуйте:**
+- Переформулировать вопрос более простыми словами
+- Использовать другие ключевые термины
+- Выбрать другое направление через /start
 
-✅ ПРИМЕР ИДЕАЛЬНОГО ОТВЕТА:
-"## Создание плана-графика
+📋 **Доступные направления:**
+- **44 ФЗ** — Контрактная система (1147 Q&A + 133 инструкции)
+- **223 ФЗ** — Закупки отдельными юр. лицами (316 Q&A + 18 инструкций)
+- **АРИП** — Аукционы по реализации имущества (461 Q&A + 31 инструкция)
 
-Для создания плана-графика в ЕАСУЗ 44-ФЗ выполните следующие действия:
+Источник: База знаний {cat_name}"""
 
-### Шаг 1: Вход в систему
-- Откройте раздел **"План-график"**
-- Нажмите **"Создать новый"**
-
-### Шаг 2: Заполнение
-- Укажите период планирования
-- Добавьте позиции закупок
-...
-
-<b>Источник:</b> Инструкция по созданию плана-графика.pdf
-
-💡 **Рекомендация:** Рекомендуется проверить все обязательные поля перед сохранением."
-
-ОТВЕЧАЙ СЕЙЧАС:"""
-    
-    def _no_docs_response(self) -> str:
-        """Ответ когда документы не найдены"""
-        return """К сожалению, по вашему запросу ничего не найдено в базе знаний.
-
-Попробуйте:
-- Переформулировать вопрос проще
-- Использовать ключевые слова (например: "заявка", "закупка", "план-график")
-- Выбрать категорию из главного меню"""
-    
     def _error_response(self) -> str:
-        """Ответ при ошибке API"""
-        return """❌ Произошла ошибка при обработке запроса.
+        return """❌ Произошла техническая ошибка.
 
-Попробуйте:
-- Повторить запрос через минуту
-- Упростить формулировку вопроса
-- Выбрать категорию из меню
+Попробуйте повторить запрос через 1-2 минуты.
 
-Если проблема повторяется — обратитесь к администратору."""
+Если ошибка повторяется — обратитесь к администратору.
+
+Источник: Ошибка обработки запроса"""
