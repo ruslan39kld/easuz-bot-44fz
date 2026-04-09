@@ -44,20 +44,16 @@ class HybridSearch:
         self.ntotal = len(self.metadata)
 
         logging.info(f"[HybridSearch] Загрузка модели эмбеддингов: {model_name}")
-        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-        model_path = os.path.join(cache_dir, model_name.replace("/", "--"))
+        # Проверяем локальную модель
+        local_model_path = "./models/paraphrase-multilingual-MiniLM-L12-v2"
 
         try:
-            if os.path.exists(model_path):
-                logging.info(f"[HybridSearch] Загрузка из кэша: {model_path}")
-                self.model = SentenceTransformer(model_path, device='cpu')
+            if os.path.exists(local_model_path):
+                logging.info(f"[HybridSearch] Загрузка из локальной папки: {local_model_path}")
+                self.model = SentenceTransformer(local_model_path, device='cpu')
             else:
-                logging.info(f"[HybridSearch] Первая загрузка с HuggingFace")
-                self.model = SentenceTransformer(
-                    model_name,
-                    device='cpu',
-                    cache_folder=cache_dir
-                )
+                logging.info(f"[HybridSearch] Загрузка с HuggingFace: {model_name}")
+                self.model = SentenceTransformer(model_name, device='cpu')
         except Exception as e:
             if "429" in str(e) or "Too Many Requests" in str(e):
                 raise RuntimeError(
