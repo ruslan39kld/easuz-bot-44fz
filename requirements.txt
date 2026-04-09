@@ -17,3 +17,4 @@ python-dotenv==1.0.0
 yadisk==3.1.0
 aiofiles==23.2.1
 torch==2.9.0
+gigachat
