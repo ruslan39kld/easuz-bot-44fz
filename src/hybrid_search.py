@@ -44,7 +44,28 @@ class HybridSearch:
         self.ntotal = len(self.metadata)
 
         logging.info(f"[HybridSearch] Загрузка модели эмбеддингов: {model_name}")
-        self.model = SentenceTransformer(model_name)
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        model_path = os.path.join(cache_dir, model_name.replace("/", "--"))
+
+        try:
+            if os.path.exists(model_path):
+                logging.info(f"[HybridSearch] Загрузка из кэша: {model_path}")
+                self.model = SentenceTransformer(model_path, device='cpu')
+            else:
+                logging.info(f"[HybridSearch] Первая загрузка с HuggingFace")
+                self.model = SentenceTransformer(
+                    model_name,
+                    device='cpu',
+                    cache_folder=cache_dir
+                )
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                raise RuntimeError(
+                    "HuggingFace API Rate Limit (429). Решения:\n"
+                    "1. Подождите 1 час\n"
+                    "2. Установите токен: export HUGGING_FACE_HUB_TOKEN='ваш_токен'"
+                ) from e
+            raise
 
         logging.info("[HybridSearch] Построение BM25 корпуса по метаданным индекса...")
         self.corpus_texts: List[str] = []
